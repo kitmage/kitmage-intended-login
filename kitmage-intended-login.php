@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Kitmage Intended Login
  * Description: Persists and honors intended front-end URLs across Force Login, WordPress login, FluentAuth, and FluentForms registration flows.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Mike@KitMage
  * Author URI: https://kitmage.com
  * License: GPL-2.0-or-later
@@ -16,6 +16,7 @@ if (!defined('ABSPATH')) {
 define('KITMAGE_INTENDED_COOKIE', 'kitmage_intended_path');
 define('KITMAGE_INTENDED_TTL', 15 * MINUTE_IN_SECONDS);
 define('KITMAGE_INTENDED_EXCLUSIONS_OPTION', 'kitmage_intended_exclusion_slugs');
+define('KITMAGE_EARLY_PROTECTED_PREFIXES_OPTION', 'kitmage_early_protected_prefixes');
 
 /**
  * Sanitize an intended destination into a safe on-site path with optional query.
@@ -284,9 +285,127 @@ function kitmage_current_request_matches_intended_exclusion_slug() {
 }
 
 /**
+ * Sanitize opt-in early-protection URL path prefixes.
+ *
+ * Examples: "contracts" or "members/private". An empty list disables this
+ * additional guard; Force Login keeps handling ordinary pages as before.
+ *
+ * @param mixed $value Option value or posted textarea.
+ * @return string[]
+ */
+function kitmage_sanitize_early_protected_prefixes($value) {
+    if (!is_array($value)) {
+        $value = preg_split('/[\r\n,]+/', (string) $value);
+    }
+
+    $prefixes = [];
+    foreach ($value as $entry) {
+        $entry = strtolower(trim(wp_unslash((string) $entry)));
+        $entry = trim($entry, " \t\n\r\0\x0B/");
+
+        // Restrict this setting to simple URL paths, not URLs or queries.
+        if ($entry === '' || !preg_match('~^[a-z0-9/_-]+$~', $entry)) {
+            continue;
+        }
+
+        $entry = trim(preg_replace('~/+~', '/', $entry), '/');
+        if ($entry !== '') {
+            $prefixes[] = $entry;
+        }
+    }
+
+    return array_values(array_unique($prefixes));
+}
+
+/**
+ * Get normalized, configured early-protection path prefixes.
+ *
+ * @return string[]
+ */
+function kitmage_get_early_protected_prefixes() {
+    return kitmage_sanitize_early_protected_prefixes(
+        get_option(KITMAGE_EARLY_PROTECTED_PREFIXES_OPTION, [])
+    );
+}
+
+/**
+ * Apply opt-in early authentication before other plugins render front-end pages.
+ *
+ * The guard only matches configured path-prefix boundaries and honors the
+ * existing public exclusion slugs. This catches requests (such as certain
+ * shortcodes) that exit before Force Login's template_redirect handler.
+ */
+function kitmage_enforce_early_protected_prefixes() {
+    $prefixes = kitmage_get_early_protected_prefixes();
+    if (!$prefixes || is_user_logged_in()) {
+        return;
+    }
+
+    $uri = $_SERVER['REQUEST_URI'] ?? '';
+    $path = wp_parse_url($uri, PHP_URL_PATH);
+    if (!is_string($path)) {
+        return;
+    }
+
+    $path = '/' . ltrim(strtolower(rawurldecode($path)), '/');
+
+    $protected = false;
+    foreach ($prefixes as $prefix) {
+        $base = '/' . $prefix;
+        if ($path === $base || str_starts_with($path, $base . '/')) {
+            $protected = true;
+            break;
+        }
+    }
+
+    if (!$protected || kitmage_matches_intended_exclusion_slug($path)) {
+        return;
+    }
+
+    $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+
+    // Never let an anonymous write request through to a protected endpoint.
+    if ($method !== 'GET' && $method !== 'HEAD') {
+        nocache_headers();
+        wp_die(
+            esc_html__('Login is required to access this resource.', 'kitmage-intended-login'),
+            esc_html__('Login required', 'kitmage-intended-login'),
+            ['response' => 403]
+        );
+    }
+
+    // The normal init (priority 10) cookie writer will not execute after
+    // this early redirect, so persist the intended destination here.
+    if ($method === 'GET') {
+        $intended = kitmage_sanitize_intended_path($uri);
+        if ($intended) {
+            kitmage_set_intended_cookie($intended);
+        }
+    } else {
+        $intended = '';
+    }
+
+    $redirect = $intended ? home_url($intended) : home_url('/');
+    nocache_headers();
+    wp_safe_redirect(wp_login_url($redirect), 302);
+    exit;
+}
+add_action('init', 'kitmage_enforce_early_protected_prefixes', -100);
+
+/**
  * Register the settings page and option for custom exclusions.
  */
 function kitmage_register_intended_settings() {
+    register_setting(
+        'kitmage_intended_login',
+        KITMAGE_EARLY_PROTECTED_PREFIXES_OPTION,
+        [
+            'type'              => 'array',
+            'sanitize_callback' => 'kitmage_sanitize_early_protected_prefixes',
+            'default'           => [],
+        ]
+    );
+
     register_setting(
         'kitmage_intended_login',
         KITMAGE_INTENDED_EXCLUSIONS_OPTION,
@@ -311,6 +430,20 @@ function kitmage_register_intended_settings() {
         'kitmage-intended-login',
         'kitmage_intended_exclusions_section'
     );
+    add_settings_section(
+        'kitmage_early_protection_section',
+        __('Early Login Protection', 'kitmage-intended-login'),
+        'kitmage_early_protection_section_callback',
+        'kitmage-intended-login'
+    );
+
+    add_settings_field(
+        'kitmage_early_protected_prefixes_field',
+        __('Protected path prefixes', 'kitmage-intended-login'),
+        'kitmage_early_protected_prefixes_field_callback',
+        'kitmage-intended-login',
+        'kitmage_early_protection_section'
+    );
 }
 add_action('admin_init', 'kitmage_register_intended_settings');
 
@@ -332,7 +465,7 @@ add_action('admin_menu', 'kitmage_add_intended_settings_page');
  * Explain the custom exclusions setting.
  */
 function kitmage_intended_exclusions_section_callback() {
-    echo '<p>' . esc_html__('Add one slug or partial path per line. If a request path contains any of these values, Kitmage Intended Login will not store it, redirect to it, or rewrite its login/register URLs. Force Login will also be bypassed for matching paths.', 'kitmage-intended-login') . '</p>';
+    echo '<p>' . esc_html__('Add one slug or partial path per line. If a request path contains any of these values, Kitmage Intended Login will not store it, redirect to it, or rewrite its login/register URLs. Force Login and any configured early login protection will also be bypassed for matching paths.', 'kitmage-intended-login') . '</p>';
 }
 
 /**
@@ -348,6 +481,26 @@ function kitmage_intended_exclusion_slugs_field_callback() {
     );
 
     echo '<p class="description">' . esc_html__('Partial matches are supported. For example, “teams” matches /my-account/teams/register/ and /teams-for-memberships/.', 'kitmage-intended-login') . '</p>';
+}
+
+/**
+ * Explain the opt-in early login protection setting.
+ */
+function kitmage_early_protection_section_callback() {
+    echo '<p>' . esc_html__('One URL path prefix per line, without a leading slash. Example: contracts protects /contracts/ and pages below it. Leave empty to disable early protection. Existing bypass slugs remain public.', 'kitmage-intended-login') . '</p>';
+}
+
+/**
+ * Render the early-protection path-prefix settings textarea.
+ */
+function kitmage_early_protected_prefixes_field_callback() {
+    $value = implode("\n", kitmage_get_early_protected_prefixes());
+
+    printf(
+        '<textarea name="%1$s" id="%1$s" rows="5" cols="50" class="large-text code" placeholder="contracts">%2$s</textarea>',
+        esc_attr(KITMAGE_EARLY_PROTECTED_PREFIXES_OPTION),
+        esc_textarea($value)
+    );
 }
 
 /**
